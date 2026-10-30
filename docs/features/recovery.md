@@ -199,6 +199,10 @@ Bluetooth default input (macOS, avoid_bluetooth_microphone on) // transport type
   -> built-in mic stands in, else the first other real input
   ├── no other usable input -> the Bluetooth default
   └── setting changes -> re-resolve like a device-list change -> switch once idle
+any stand-in (macOS)                                   // virtual and aggregate transports
+  -> never a virtual device (Microsoft Teams Audio, Loopback) while a
+     Bluetooth default or any hardware input is left    // silent outside its app's calls
+  └── only virtual inputs left -> the first of them; a virtual default is kept
 
 programmatic dictation (local API) when the stream interrupts or gaps
   ├── audio delivered before the loss -> kept under its id // recover.programmatic-loss
@@ -213,6 +217,7 @@ Checks in [audio.rs](../../src/audio.rs):
 `startup_retry_recovers_metadata_and_audio_without_restarting`,
 `a_missing_selection_uses_the_default_until_it_returns`,
 `a_closed_lid_passes_over_the_built_in_microphone`,
+`a_virtual_microphone_never_stands_in_for_a_real_one`,
 `where_the_os_reports_new_devices_only_a_failed_open_is_retried`,
 `only_an_idle_capture_lets_the_microphone_switch`;
 [dictation_audio.rs](../../src/dictation_audio.rs):

@@ -89,10 +89,17 @@ const OPEN_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 // Only the playback worker owns a device. It opens lazily for a tone, stays
 // open through the idle grace, and drops within one observation interval once
 // sounds turn off or the grace expires. Opening never blocks capture or UI.
+// An output whose stream failed, or that was opened before the default output
+// or the device list changed, is dropped and opened again for the next tone,
+// so unplugging a headset never leaves the tones playing into nothing.
 struct FeedbackOutput<S> {
     sink: Option<S>,
     retry_at: Instant,
     playing_until: Option<Instant>,
+    /// The [`crate::audio::output_route_generation`] the sink opened at.
+    opened_route: u64,
+    /// Set by the open sink's stream when it fails.
+    failed: Arc<AtomicBool>,
 }
 
 impl<S> FeedbackOutput<S> {
@@ -101,16 +108,43 @@ impl<S> FeedbackOutput<S> {
             sink: None,
             retry_at: Instant::now(),
             playing_until: None,
+            opened_route: 0,
+            failed: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Opens the device for a tone unless a recent failure is still backing off.
-    fn open_for_tone(&mut self, now: Instant, open: impl FnOnce() -> Result<S>) -> Result<()> {
+    /// Opens the device for a tone unless a recent failure is still backing
+    /// off, first dropping a sink that failed or predates `route`. `open`
+    /// receives the flag the new sink's stream sets when it fails.
+    fn open_for_tone(
+        &mut self,
+        now: Instant,
+        route: u64,
+        open: impl FnOnce(Arc<AtomicBool>) -> Result<S>,
+    ) -> Result<()> {
+        self.release_if_stale(route, now);
         if self.sink.is_none() && now >= self.retry_at {
             self.retry_at = now + OPEN_RETRY_BACKOFF;
-            self.sink = Some(open()?);
+            let failed = Arc::new(AtomicBool::new(false));
+            self.sink = Some(open(failed.clone())?);
+            self.failed = failed;
+            self.opened_route = route;
         }
         Ok(())
+    }
+
+    /// Drops a sink whose stream failed or whose device route changed since
+    /// it opened. The next open is immediate: this is no open failure.
+    fn release_if_stale(&mut self, route: u64, now: Instant) {
+        if self.sink.is_none() {
+            return;
+        }
+        let failed = self.failed.load(Ordering::Acquire);
+        if failed || route != self.opened_route {
+            tracing::info!(failed, "audio output changed; reopening feedback output");
+            self.sink = None;
+            self.retry_at = now;
+        }
     }
 
     fn mark_playing(&mut self, now: Instant, duration: Duration) {
@@ -793,11 +827,25 @@ impl<S: Source> Source for Retractable<S> {
     }
 }
 
-fn open_output() -> Result<MixerDeviceSink> {
+/// Opens the default output. `failed` is set when its stream reports that it
+/// stopped, lost its device, or was moved to another one.
+fn open_output(failed: Arc<AtomicBool>) -> Result<MixerDeviceSink> {
+    #[cfg(target_os = "macos")]
+    crate::audio::watch_audio_devices();
+    let on_error = move |error: rodio::cpal::Error| {
+        use rodio::cpal::ErrorKind;
+        // Overloads continue on the same device.
+        if matches!(error.kind(), ErrorKind::Xrun | ErrorKind::RealtimeDenied) {
+            return;
+        }
+        tracing::warn!(%error, "feedback output stream failed");
+        failed.store(true, Ordering::Release);
+    };
     let mut sink = DeviceSinkBuilder::from_default_device()
         .and_then(|builder| {
             builder
                 .with_buffer_size(BufferSize::Fixed(OUTPUT_BUFFER_FRAMES))
+                .with_error_callback(on_error)
                 .open_stream()
         })
         .or_else(|_| DeviceSinkBuilder::open_default_sink())
@@ -811,7 +859,8 @@ impl FeedbackOutput<MixerDeviceSink> {
     fn prepare(&mut self, now: Instant) {
         let opening = Instant::now();
         let cold = self.sink.is_none();
-        if let Err(error) = self.open_for_tone(now, open_output) {
+        let route = crate::audio::output_route_generation();
+        if let Err(error) = self.open_for_tone(now, route, open_output) {
             tracing::warn!(%error, "recording audio output unavailable; retrying");
         }
         if cold && self.sink.is_some() {
@@ -1104,7 +1153,7 @@ mod tests {
         }
         let live = Cell::new(0);
         let opens = Cell::new(0);
-        let open = || {
+        let open = |_| {
             live.set(live.get() + 1);
             opens.set(opens.get() + 1);
             Ok(Sink(&live))
@@ -1117,9 +1166,9 @@ mod tests {
         output.release_when_idle(true, now);
         assert_eq!(opens.get(), 0);
 
-        output.open_for_tone(now, open).unwrap();
+        output.open_for_tone(now, 0, open).unwrap();
         output.mark_playing(now, tone);
-        output.open_for_tone(now, open).unwrap();
+        output.open_for_tone(now, 0, open).unwrap();
         assert_eq!((opens.get(), live.get()), (1, 1));
 
         // Retained while playing and through the grace, released afterwards.
@@ -1132,7 +1181,7 @@ mod tests {
 
         // The next tone reopens immediately, without a failure backoff.
         let later = now + tone + IDLE_RELEASE_GRACE;
-        output.open_for_tone(later, open).unwrap();
+        output.open_for_tone(later, 0, open).unwrap();
         assert_eq!((opens.get(), live.get()), (2, 1));
 
         // Turning sounds off releases even while a tone is nominally playing.
@@ -1147,7 +1196,7 @@ mod tests {
     fn overlapping_tones_extend_playback_instead_of_truncating_it() {
         let mut output = FeedbackOutput::new();
         let now = Instant::now();
-        output.open_for_tone(now, || Ok(())).unwrap();
+        output.open_for_tone(now, 0, |_| Ok(())).unwrap();
         output.mark_playing(now, Duration::from_secs(2));
         output.mark_playing(now + Duration::from_millis(300), Duration::from_secs(1));
         assert_eq!(output.playing_until, Some(now + Duration::from_secs(2)));
@@ -1164,19 +1213,51 @@ mod tests {
         let now = Instant::now();
         assert!(
             output
-                .open_for_tone(now, || Err(eyre!("device unavailable")))
+                .open_for_tone(now, 0, |_| Err(eyre!("device unavailable")))
                 .is_err()
         );
         output
-            .open_for_tone(now + Duration::from_secs(1), || -> Result<()> {
+            .open_for_tone(now + Duration::from_secs(1), 0, |_| -> Result<()> {
                 panic!("must not spin on device failure")
             })
             .unwrap();
         assert!(!output.is_open());
         output
-            .open_for_tone(now + OPEN_RETRY_BACKOFF, || Ok(()))
+            .open_for_tone(now + OPEN_RETRY_BACKOFF, 0, |_| Ok(()))
             .unwrap();
         assert!(output.is_open());
+    }
+
+    #[test]
+    fn a_failed_or_rerouted_output_reopens_for_the_next_tone() {
+        let mut output = FeedbackOutput::new();
+        let now = Instant::now();
+        let mut stream_failed = None;
+        output
+            .open_for_tone(now, 0, |failed| {
+                stream_failed = Some(failed);
+                Ok(1)
+            })
+            .unwrap();
+
+        // An unchanged route keeps the open sink.
+        output
+            .open_for_tone(now, 0, |_| -> Result<i32> {
+                panic!("must keep a working output")
+            })
+            .unwrap();
+
+        // The stream failing, as when its headset is unplugged, reopens at
+        // once rather than waiting out a failure backoff.
+        stream_failed.unwrap().store(true, Ordering::Release);
+        output.open_for_tone(now, 0, |_| Ok(2)).unwrap();
+        assert_eq!(output.sink, Some(2));
+
+        // So does a new default output or device list.
+        output.open_for_tone(now, 1, |_| Ok(3)).unwrap();
+        assert_eq!(output.sink, Some(3));
+        output.open_for_tone(now, 1, |_| Ok(4)).unwrap();
+        assert_eq!(output.sink, Some(3));
     }
 
     #[test]
@@ -1266,7 +1347,7 @@ mod tests {
                 sink.log_on_drop(false);
                 sink
             } else {
-                open_output().unwrap()
+                open_output(Arc::default()).unwrap()
             }
         };
         let measure = |sink: &mut Option<MixerDeviceSink>, label: &str| {

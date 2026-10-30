@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 static AUDIO_SERVICE_RESTART_GENERATION: AtomicU64 = AtomicU64::new(0);
 static INPUT_ROUTE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static OUTPUT_ROUTE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static STREAM_GLITCHED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 static AVOID_BLUETOOTH_MICROPHONE: AtomicBool = AtomicBool::new(true);
 
@@ -55,11 +56,25 @@ fn notify_input_route_changed() {
     INPUT_ROUTE_GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
-/// Registers the CoreAudio listeners behind [`audio_service_restart_generation`]
-/// and [`input_route_generation`]. Their callbacks run on CoreAudio's
-/// notification thread, never the audio callback, and only bump a counter.
+/// Advances when macOS's default output or its list of devices changes, or
+/// CoreAudio restarts, so an output opened on the old default (the feedback
+/// tones') opens again instead of playing into a headset that is gone.
+/// Other OSes report a lost output only through its stream's errors.
+pub fn output_route_generation() -> u64 {
+    OUTPUT_ROUTE_GENERATION.load(Ordering::Acquire)
+}
+
 #[cfg(target_os = "macos")]
-pub fn watch_input_devices() {
+fn notify_output_route_changed() {
+    OUTPUT_ROUTE_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Registers the CoreAudio listeners behind [`audio_service_restart_generation`],
+/// [`input_route_generation`], and [`output_route_generation`]. Their
+/// callbacks run on CoreAudio's notification thread, never the audio
+/// callback, and only bump a counter.
+#[cfg(target_os = "macos")]
+pub fn watch_audio_devices() {
     use std::ffi::c_void;
     use std::sync::Once;
 
@@ -90,6 +105,7 @@ pub fn watch_input_devices() {
     ) -> i32 {
         tracing::warn!("CoreAudio daemon (coreaudiod) restarted; recovering microphone stream");
         notify_audio_service_restarted();
+        notify_output_route_changed();
         0
     }
 
@@ -103,17 +119,40 @@ pub fn watch_input_devices() {
         0
     }
 
+    unsafe extern "C" fn on_outputs_changed(
+        _in_object_id: u32,
+        _in_number_addresses: u32,
+        _in_addresses: *const AudioObjectPropertyAddress,
+        _in_client_data: *mut c_void,
+    ) -> i32 {
+        notify_output_route_changed();
+        0
+    }
+
+    unsafe extern "C" fn on_devices_changed(
+        _in_object_id: u32,
+        _in_number_addresses: u32,
+        _in_addresses: *const AudioObjectPropertyAddress,
+        _in_client_data: *mut c_void,
+    ) -> i32 {
+        notify_input_route_changed();
+        notify_output_route_changed();
+        0
+    }
+
     static REGISTER: Once = Once::new();
     REGISTER.call_once(|| {
         const SYSTEM_OBJECT: u32 = 1;
         const SERVICE_RESTARTED_SELECTOR: u32 = u32::from_be_bytes(*b"srst");
         const DEFAULT_INPUT_SELECTOR: u32 = u32::from_be_bytes(*b"dIn ");
+        const DEFAULT_OUTPUT_SELECTOR: u32 = u32::from_be_bytes(*b"dOut");
         const DEVICES_SELECTOR: u32 = u32::from_be_bytes(*b"dev#");
         const GLOBAL_SCOPE: u32 = u32::from_be_bytes(*b"glob");
-        let listeners: [(u32, PropertyListenerProc); 3] = [
+        let listeners: [(u32, PropertyListenerProc); 4] = [
             (SERVICE_RESTARTED_SELECTOR, on_service_restarted),
             (DEFAULT_INPUT_SELECTOR, on_inputs_changed),
-            (DEVICES_SELECTOR, on_inputs_changed),
+            (DEFAULT_OUTPUT_SELECTOR, on_outputs_changed),
+            (DEVICES_SELECTOR, on_devices_changed),
         ];
         for (selector, listener) in listeners {
             let addr = AudioObjectPropertyAddress {
@@ -125,7 +164,7 @@ pub fn watch_input_devices() {
                 AudioObjectAddPropertyListener(SYSTEM_OBJECT, &addr, listener, std::ptr::null_mut())
             };
             if status != 0 {
-                tracing::warn!(status, "could not watch CoreAudio input devices");
+                tracing::warn!(status, "could not watch CoreAudio devices");
             }
         }
         // Closing the lid switches the built-in microphone off without
@@ -526,7 +565,7 @@ impl AudioInput {
     /// it keeps running on the old device.
     fn open_device(device: Device, device_name: String, follows_default: bool) -> Result<Self> {
         #[cfg(target_os = "macos")]
-        watch_input_devices();
+        watch_audio_devices();
         let restart_generation = audio_service_restart_generation();
         let supported = device
             .default_input_config()
@@ -968,7 +1007,7 @@ enum InputTarget {
     /// A real input standing in for a default that is Hex Microphone, the
     /// built-in microphone with the lid closed, a passed-over Bluetooth
     /// headset, or missing: the built-in microphone while the lid is open,
-    /// else the first usable one listed.
+    /// else the first usable hardware input listed.
     StandIn(usize),
 }
 
@@ -979,6 +1018,9 @@ enum Transport {
     /// Bluetooth or Bluetooth LE: opening its microphone switches the
     /// headset into low-quality call audio.
     Bluetooth,
+    /// A virtual or aggregate device, such as Microsoft Teams Audio or
+    /// Loopback, which records silence unless its app feeds it.
+    Virtual,
     Other,
 }
 
@@ -1007,8 +1049,10 @@ struct InputPlan {
 /// built-in microphone is switched off in hardware though still listed, so
 /// it is passed over the same way. With `avoid_bluetooth`, a Bluetooth
 /// default is passed over for the built-in microphone, else the first other
-/// real input, and kept only when nothing else is usable. Saved microphones
-/// and `--device` are never passed over for being Bluetooth.
+/// real input, and kept only when nothing else is usable. A stand-in is never
+/// a virtual device while a Bluetooth default or any hardware input is left:
+/// an app's virtual microphone records silence outside that app's calls.
+/// Saved microphones, `--device`, and a virtual default are used as named.
 fn resolve_input(
     device_override: Option<&str>,
     selected: Option<&str>,
@@ -1059,13 +1103,20 @@ fn resolve_input(
         });
     }
     let usable = || (0..names.len()).filter(|&index| !is_hex(&names[index]) && !off(index));
+    let virtual_device = |index: usize| transport(index) == Transport::Virtual;
     usable()
         .find(|&index| is_built_in(index))
-        .or_else(|| usable().find(|&index| !avoided(index)))
+        .or_else(|| usable().find(|&index| !avoided(index) && !virtual_device(index)))
         .map(InputTarget::StandIn)
         // A Bluetooth default beats recording nothing.
         .or_else(|| default_usable.then_some(InputTarget::SystemDefault))
-        .or_else(|| usable().next().map(InputTarget::StandIn))
+        // Then any hardware input, and a virtual one only when none is left.
+        .or_else(|| {
+            usable()
+                .find(|&index| !virtual_device(index))
+                .or_else(|| usable().next())
+                .map(InputTarget::StandIn)
+        })
         .map(|target| InputPlan { target, selection })
         .ok_or_else(|| {
             if (0..names.len()).any(off) {
@@ -1408,7 +1459,7 @@ pub struct InputDevices {
 
 pub fn input_devices() -> Result<InputDevices> {
     #[cfg(target_os = "macos")]
-    watch_input_devices();
+    watch_audio_devices();
     let host = cpal::default_host();
     let (devices, listed) = input_devices_of(&host)?;
     let default = default_input_of(&host).map(|(_, name)| name);
@@ -1483,8 +1534,9 @@ fn transport(device: &Device) -> Transport {
     use objc2_core_audio::{
         AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress,
         AudioObjectPropertySelector, kAudioDevicePropertyTransportType,
-        kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE,
-        kAudioDeviceTransportTypeBuiltIn, kAudioHardwarePropertyTranslateUIDToDevice,
+        kAudioDeviceTransportTypeAggregate, kAudioDeviceTransportTypeBluetooth,
+        kAudioDeviceTransportTypeBluetoothLE, kAudioDeviceTransportTypeBuiltIn,
+        kAudioDeviceTransportTypeVirtual, kAudioHardwarePropertyTranslateUIDToDevice,
         kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject,
     };
     use objc2_core_foundation::CFString;
@@ -1536,6 +1588,12 @@ fn transport(device: &Device) -> Transport {
                 || kind == kAudioDeviceTransportTypeBluetoothLE =>
         {
             Transport::Bluetooth
+        }
+        Some(kind)
+            if kind == kAudioDeviceTransportTypeVirtual
+                || kind == kAudioDeviceTransportTypeAggregate =>
+        {
+            Transport::Virtual
         }
         _ => Transport::Other,
     }
@@ -1790,6 +1848,71 @@ mod tests {
                 }
             ),
             found(SystemDefault)
+        );
+    }
+
+    #[test]
+    fn a_virtual_microphone_never_stands_in_for_a_real_one() {
+        use InputTarget::{StandIn, SystemDefault};
+        use Transport::{Bluetooth, BuiltIn, Other, Virtual};
+        let avoid = Route {
+            lid_closed: true,
+            avoid_bluetooth: true,
+        };
+        let found = |target| {
+            Ok(InputPlan {
+                target,
+                selection: Selection::InUse,
+            })
+        };
+
+        // Lid closed, USB headset unplugged: the AirPods beat Teams' silence.
+        let names = listed(&[
+            "MacBook Pro Microphone",
+            "Microsoft Teams Audio",
+            "AirPods - Find My",
+        ]);
+        let transports = |index: usize| [BuiltIn, Virtual, Bluetooth][index];
+        let plan = |default| resolve_input(None, None, &names, default, transports, avoid);
+        assert_eq!(plan(Some("AirPods - Find My")), found(SystemDefault));
+        assert_eq!(plan(Some("MacBook Pro Microphone")), found(StandIn(2)));
+
+        // A hardware input still stands in before Bluetooth.
+        let with_usb = listed(&["Microsoft Teams Audio", "AirPods Pro", "USB Mic"]);
+        let with_usb_transports = |index: usize| [Virtual, Bluetooth, Other][index];
+        assert_eq!(
+            resolve_input(
+                None,
+                None,
+                &with_usb,
+                Some("AirPods Pro"),
+                with_usb_transports,
+                avoid
+            ),
+            found(StandIn(2))
+        );
+
+        // A virtual default is the user's choice, and with nothing else
+        // listed a virtual input beats no microphone.
+        let only_virtual = listed(&["Microsoft Teams Audio", "MacBook Pro Microphone"]);
+        let only_virtual_transports = |index: usize| [Virtual, BuiltIn][index];
+        let virtual_plan = |default| {
+            resolve_input(
+                None,
+                None,
+                &only_virtual,
+                default,
+                only_virtual_transports,
+                avoid,
+            )
+        };
+        assert_eq!(
+            virtual_plan(Some("Microsoft Teams Audio")),
+            found(SystemDefault)
+        );
+        assert_eq!(
+            virtual_plan(Some("MacBook Pro Microphone")),
+            found(StandIn(0))
         );
     }
 

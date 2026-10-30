@@ -1041,6 +1041,17 @@ samples remain decoded in memory. A tone that arrives after the grace pays a
 cold device open first; the tone is delayed, not clipped or dropped.
 Overlapping tones extend the playing window rather than shortening it.
 
+**Fixed after 2.3.1:** the open output followed nothing. Unplugging a USB or
+Bluetooth headset that was the default output left the warm sink on a stream
+CoreAudio had paused or lost, and every tone inside the grace (which each tone
+extends) went nowhere until Hex restarted. The worker now drops the sink when
+its stream reports a failure or device change, or when macOS reports a new
+default output, a device-list change, or a CoreAudio restart
+(`audio::output_route_generation`), and opens the current default for the next
+tone without the failure backoff. Check:
+`feedback::tests::a_failed_or_rerouted_output_reopens_for_the_next_tone`
+(unit; the device events themselves need a real unplug on a Mac).
+
 **Fixed after 2.3.0:** the start tone used to wait for the 300 ms intentional
 hold, then pay rodio's default 50 ms output buffer, so it sounded about 345 ms
 after the press (about 375 ms from a cold device) where the Swift app rang on
