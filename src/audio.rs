@@ -1050,8 +1050,8 @@ struct InputPlan {
 /// it is passed over the same way. With `avoid_bluetooth`, a Bluetooth
 /// default is passed over for the built-in microphone, else the first other
 /// real input, and kept only when nothing else is usable. A stand-in is never
-/// a virtual device while a Bluetooth default or any hardware input is left:
-/// an app's virtual microphone records silence outside that app's calls.
+/// a virtual device: an app's virtual microphone records silence outside
+/// that app's calls, so with no real input left the error says why.
 /// Saved microphones, `--device`, and a virtual default are used as named.
 fn resolve_input(
     device_override: Option<&str>,
@@ -1110,11 +1110,11 @@ fn resolve_input(
         .map(InputTarget::StandIn)
         // A Bluetooth default beats recording nothing.
         .or_else(|| default_usable.then_some(InputTarget::SystemDefault))
-        // Then any hardware input, and a virtual one only when none is left.
+        // Then any hardware input. A virtual one would record silence, so
+        // reporting why there is no microphone beats standing it in.
         .or_else(|| {
             usable()
                 .find(|&index| !virtual_device(index))
-                .or_else(|| usable().next())
                 .map(InputTarget::StandIn)
         })
         .map(|target| InputPlan { target, selection })
@@ -1892,8 +1892,8 @@ mod tests {
             found(StandIn(2))
         );
 
-        // A virtual default is the user's choice, and with nothing else
-        // listed a virtual input beats no microphone.
+        // A virtual default is the user's choice, but with no real input
+        // left a virtual one never stands in: the lid's error says why.
         let only_virtual = listed(&["Microsoft Teams Audio", "MacBook Pro Microphone"]);
         let only_virtual_transports = |index: usize| [Virtual, BuiltIn][index];
         let virtual_plan = |default| {
@@ -1912,7 +1912,24 @@ mod tests {
         );
         assert_eq!(
             virtual_plan(Some("MacBook Pro Microphone")),
-            found(StandIn(0))
+            Err(LID_CLOSED_ERROR.into())
+        );
+
+        // Without a lid to blame, the error says no microphone is available.
+        let lid_open = Route {
+            lid_closed: false,
+            avoid_bluetooth: true,
+        };
+        assert_eq!(
+            resolve_input(
+                None,
+                None,
+                &listed(&["Microsoft Teams Audio"]),
+                None,
+                |_| Virtual,
+                lid_open
+            ),
+            Err("no microphone is available".into())
         );
     }
 
